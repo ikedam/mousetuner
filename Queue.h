@@ -36,7 +36,25 @@ mousetunerQueueInitialize(
 //
 // Events from the IoQueue object
 //
-EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL mousetunerEvtIoDeviceControl;
-EVT_WDF_IO_QUEUE_IO_STOP mousetunerEvtIoStop;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL mousetunerEvtIoInternalDeviceControl;
+
+NTSTATUS
+mousetunerEvtIoInternalMouseConnect(
+    _In_ WDFREQUEST Request,
+    _In_ WDFDEVICE hDevice,
+    _In_ PDEVICE_CONTEXT devExt
+);
+VOID
+mousetunerDispatchPassThrough(
+    _In_ WDFREQUEST Request,
+    _In_ WDFIOTARGET Target
+);
+VOID
+mousetunerServiceCallback(
+    IN PDEVICE_OBJECT DeviceObject,
+    IN PMOUSE_INPUT_DATA InputDataStart,
+    IN PMOUSE_INPUT_DATA InputDataEnd,
+    IN OUT PULONG InputDataConsumed
+);
 
 EXTERN_C_END

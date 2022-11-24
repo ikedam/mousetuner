@@ -4,11 +4,11 @@
 
 [Version]
 Signature="$WINDOWS NT$"
-Class=System ; TODO: specify appropriate Class
-ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318} ; TODO: specify appropriate ClassGuid
+Class=Mouse
+ClassGuid={4d36e96f-e325-11ce-bfc1-08002be10318}
 Provider=%ManufacturerName%
 CatalogFile=mousetuner.cat
-DriverVer= ; TODO: set DriverVer in stampinf property pages
+DriverVer=11/20/2022, 0.0.0.1
 PnpLockdown=1
 
 [DestinationDirs]
@@ -30,9 +30,11 @@ WdfCoInstaller$KMDFCOINSTALLERVERSION$.dll=1 ; make sure the number matches with
 %ManufacturerName%=Standard,NT$ARCH$
 
 [Standard.NT$ARCH$]
-%mousetuner.DeviceDesc%=mousetuner_Device, Root\mousetuner ; TODO: edit hw-id
+%mousetuner.DeviceDesc%=mousetuner_Device, HID\{00001812-0000-1000-8000-00805f9b34fb}_Dev_VID&02056e_PID&0156&Col01
 
 [mousetuner_Device.NT]
+Include=msmouse.inf
+Needs=HID_Mouse_Inst.NT
 CopyFiles=Drivers_Dir
 
 [Drivers_Dir]
@@ -40,7 +42,9 @@ mousetuner.sys
 
 ;-------------- Service installation
 [mousetuner_Device.NT.Services]
-AddService = mousetuner,%SPSVCINST_ASSOCSERVICE%, mousetuner_Service_Inst
+AddService = mousetuner, , mousetuner_Service_Inst
+Include=msmouse.inf
+Needs=HID_Mouse_Inst.NT.Services
 
 ; -------------- mousetuner driver install sections
 [mousetuner_Service_Inst]
@@ -49,6 +53,17 @@ ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
 StartType      = 3               ; SERVICE_DEMAND_START
 ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
 ServiceBinary  = %12%\mousetuner.sys
+
+[mousetuner_Device.NT.HW]
+; Add the device upper filter
+AddReg = mousetuner_Device.HW.AddReg
+
+; run the directives need by the port driver
+Include=msmouse.inf
+Needs=HID_Mouse_Inst.NT.HW
+
+[mousetuner_Device.HW.AddReg]
+HKR,,"UpperFilters",0x00010000,"mousetuner"
 
 ;
 ;--- mousetuner_Device Coinstaller installation ------
@@ -70,8 +85,7 @@ KmdfService =  mousetuner, mousetuner_wdfsect
 KmdfLibraryVersion = $KMDFVERSION$
 
 [Strings]
-SPSVCINST_ASSOCSERVICE= 0x00000002
-ManufacturerName="<Your manufacturer name>" ;TODO: Replace with your manufacturer name
+ManufacturerName="ikedam.jp" ;TODO: Replace with your manufacturer name
 DiskName = "mousetuner Installation Disk"
 mousetuner.DeviceDesc = "mousetuner Device"
 mousetuner.SVCDESC = "mousetuner Service"

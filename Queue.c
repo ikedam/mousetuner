@@ -19,6 +19,7 @@ Environment:
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text (PAGE, mousetunerQueueInitialize)
+#pragma alloc_text (PAGE, mousetunerEvtIoInternalDeviceControl)
 #endif
 
 NTSTATUS
@@ -46,7 +47,6 @@ Return Value:
 
 --*/
 {
-    WDFQUEUE queue;
     NTSTATUS status;
     WDF_IO_QUEUE_CONFIG queueConfig;
 
@@ -62,14 +62,13 @@ Return Value:
         WdfIoQueueDispatchParallel
         );
 
-    queueConfig.EvtIoDeviceControl = mousetunerEvtIoDeviceControl;
-    queueConfig.EvtIoStop = mousetunerEvtIoStop;
+    queueConfig.EvtIoInternalDeviceControl = mousetunerEvtIoInternalDeviceControl;
 
     status = WdfIoQueueCreate(
                  Device,
                  &queueConfig,
                  WDF_NO_OBJECT_ATTRIBUTES,
-                 &queue
+                 WDF_NO_HANDLE // default queue
                  );
 
     if(!NT_SUCCESS(status)) {
@@ -81,7 +80,7 @@ Return Value:
 }
 
 VOID
-mousetunerEvtIoDeviceControl(
+mousetunerEvtIoInternalDeviceControl(
     _In_ WDFQUEUE Queue,
     _In_ WDFREQUEST Request,
     _In_ size_t OutputBufferLength,
@@ -92,7 +91,22 @@ mousetunerEvtIoDeviceControl(
 
 Routine Description:
 
-    This event is invoked when the framework receives IRP_MJ_DEVICE_CONTROL request.
+    This routine is the dispatch routine for internal device control requests.
+    There are two specific control codes that are of interest:
+
+    IOCTL_INTERNAL_MOUSE_CONNECT:
+        Store the old context and function pointer and replace it with our own.
+        This makes life much simpler than intercepting IRPs sent by the RIT and
+        modifying them on the way back up.
+
+    IOCTL_INTERNAL_I8042_HOOK_MOUSE:
+        Add in the necessary function pointers and context values so that we can
+        alter how the ps/2 mouse is initialized.
+
+    NOTE:  Handling IOCTL_INTERNAL_I8042_HOOK_MOUSE is *NOT* necessary if
+           all you want to do is filter MOUSE_INPUT_DATAs.  You can remove
+           the handling code and all related device extension fields and
+           functions to conserve space.
 
 Arguments:
 
@@ -113,87 +127,198 @@ Return Value:
 
 --*/
 {
-    TraceEvents(TRACE_LEVEL_INFORMATION, 
-                TRACE_QUEUE, 
-                "%!FUNC! Queue 0x%p, Request 0x%p OutputBufferLength %d InputBufferLength %d IoControlCode %d", 
-                Queue, Request, (int) OutputBufferLength, (int) InputBufferLength, IoControlCode);
+    WDFDEVICE hDevice;
+    PDEVICE_CONTEXT devExt;
+    NTSTATUS status = STATUS_SUCCESS;
 
-    WdfRequestComplete(Request, STATUS_SUCCESS);
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
+
+    PAGED_CODE();
+
+    hDevice = WdfIoQueueGetDevice(Queue);
+    devExt = DeviceGetContext(hDevice);
+
+    switch (IoControlCode) {
+    case IOCTL_INTERNAL_MOUSE_CONNECT:
+        status = mousetunerEvtIoInternalMouseConnect(
+            Request,
+            hDevice,
+            devExt
+        );
+        break;
+    //
+    // Disconnect a mouse class device driver from the port driver.
+    //
+    case IOCTL_INTERNAL_MOUSE_DISCONNECT:
+        status = STATUS_NOT_IMPLEMENTED;
+        break;
+    }
+
+    if (!NT_SUCCESS(status)) {
+        WdfRequestComplete(Request, status);
+        return;
+    }
+
+    mousetunerDispatchPassThrough(Request, WdfDeviceGetIoTarget(hDevice));
+}
+
+NTSTATUS
+mousetunerEvtIoInternalMouseConnect(
+    _In_ WDFREQUEST Request,
+    _In_ WDFDEVICE hDevice,
+    _In_ PDEVICE_CONTEXT devExt
+)
+{
+    NTSTATUS status;
+    PCONNECT_DATA connectData;
+    size_t length;
+
+    //
+    // Only allow one connection.
+    //
+    if (devExt->UpperConnectData.ClassService != NULL) {
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_QUEUE, "Duplicated connection");
+        return STATUS_SHARING_VIOLATION;
+    }
+
+    //
+    // Copy the connection parameters to the device extension.
+    //
+    status = WdfRequestRetrieveInputBuffer(
+        Request,
+        sizeof(CONNECT_DATA),
+        &connectData,
+        &length
+    );
+    if (!NT_SUCCESS(status)) {
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_QUEUE, "WdfRequestRetrieveInputBuffer failed %!STATUS!", status);
+        return status;
+    }
+
+    devExt->UpperConnectData = *connectData;
+
+    //
+    // Hook into the report chain.  Everytime a mouse packet is reported to
+    // the system, MouFilter_ServiceCallback will be called
+    //
+    connectData->ClassDeviceObject = WdfDeviceWdmGetDeviceObject(hDevice);
+    connectData->ClassService = (PVOID)mousetunerServiceCallback;
+
+    return STATUS_SUCCESS;
+}
+
+
+VOID
+mousetunerDispatchPassThrough(
+    _In_ WDFREQUEST Request,
+    _In_ WDFIOTARGET Target
+)
+/*++
+Routine Description:
+
+    Passes a request on to the lower driver.
+ 
+--*/
+{
+    //
+    // Pass the IRP to the target
+    //
+
+    WDF_REQUEST_SEND_OPTIONS options;
+    BOOLEAN ret;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    //
+    // We are not interested in post processing the IRP so 
+    // fire and forget.
+    //
+    WDF_REQUEST_SEND_OPTIONS_INIT(
+        &options,
+        WDF_REQUEST_SEND_OPTION_SEND_AND_FORGET
+    );
+
+    ret = WdfRequestSend(Request, Target, &options);
+
+    if (ret == FALSE) {
+        status = WdfRequestGetStatus(Request);
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_QUEUE, "WdfRequestSend failed %!STATUS!", status);
+        WdfRequestComplete(Request, status);
+    }
 
     return;
 }
 
 VOID
-mousetunerEvtIoStop(
-    _In_ WDFQUEUE Queue,
-    _In_ WDFREQUEST Request,
-    _In_ ULONG ActionFlags
+mousetunerServiceCallback(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PMOUSE_INPUT_DATA InputDataStart,
+    _In_ PMOUSE_INPUT_DATA InputDataEnd,
+    _Inout_ PULONG InputDataConsumed
 )
 /*++
-
+https://learn.microsoft.com/en-us/previous-versions/ff542380(v=vs.85)
 Routine Description:
 
-    This event is invoked for a power-managed queue before the device leaves the working state (D0).
+    Called when there are mouse packets to report to the RIT.  You can do
+    anything you like to the packets.  For instance:
+
+    o Drop a packet altogether
+    o Mutate the contents of a packet
+    o Insert packets into the stream
 
 Arguments:
 
-    Queue -  Handle to the framework queue object that is associated with the
-             I/O request.
+    DeviceObject - Context passed during the connect IOCTL
 
-    Request - Handle to a framework request object.
+    InputDataStart - First packet to be reported
 
-    ActionFlags - A bitwise OR of one or more WDF_REQUEST_STOP_ACTION_FLAGS-typed flags
-                  that identify the reason that the callback function is being called
-                  and whether the request is cancelable.
+    InputDataEnd - One past the last packet to be reported.  Total number of
+                   packets is equal to InputDataEnd - InputDataStart
+
+    InputDataConsumed - Set to the total number of packets consumed by the RIT
+                        (via the function pointer we replaced in the connect
+                        IOCTL)
 
 Return Value:
 
-    VOID
+    Status is returned.
 
 --*/
 {
-    TraceEvents(TRACE_LEVEL_INFORMATION, 
-                TRACE_QUEUE, 
-                "%!FUNC! Queue 0x%p, Request 0x%p ActionFlags %d", 
-                Queue, Request, ActionFlags);
+    PDEVICE_CONTEXT devExt;
+    WDFDEVICE hDevice;
 
-    //
-    // In most cases, the EvtIoStop callback function completes, cancels, or postpones
-    // further processing of the I/O request.
-    //
-    // Typically, the driver uses the following rules:
-    //
-    // - If the driver owns the I/O request, it calls WdfRequestUnmarkCancelable
-    //   (if the request is cancelable) and either calls WdfRequestStopAcknowledge
-    //   with a Requeue value of TRUE, or it calls WdfRequestComplete with a
-    //   completion status value of STATUS_SUCCESS or STATUS_CANCELLED.
-    //
-    //   Before it can call these methods safely, the driver must make sure that
-    //   its implementation of EvtIoStop has exclusive access to the request.
-    //
-    //   In order to do that, the driver must synchronize access to the request
-    //   to prevent other threads from manipulating the request concurrently.
-    //   The synchronization method you choose will depend on your driver's design.
-    //
-    //   For example, if the request is held in a shared context, the EvtIoStop callback
-    //   might acquire an internal driver lock, take the request from the shared context,
-    //   and then release the lock. At this point, the EvtIoStop callback owns the request
-    //   and can safely complete or requeue the request.
-    //
-    // - If the driver has forwarded the I/O request to an I/O target, it either calls
-    //   WdfRequestCancelSentRequest to attempt to cancel the request, or it postpones
-    //   further processing of the request and calls WdfRequestStopAcknowledge with
-    //   a Requeue value of FALSE.
-    //
-    // A driver might choose to take no action in EvtIoStop for requests that are
-    // guaranteed to complete in a small amount of time.
-    //
-    // In this case, the framework waits until the specified request is complete
-    // before moving the device (or system) to a lower power state or removing the device.
-    // Potentially, this inaction can prevent a system from entering its hibernation state
-    // or another low system power state. In extreme cases, it can cause the system
-    // to crash with bugcheck code 9F.
-    //
+    for (PMOUSE_INPUT_DATA data = InputDataStart; data < InputDataEnd; ++data) {
+        USHORT newButtonFlags = data->ButtonFlags & ~(MOUSE_LEFT_BUTTON_DOWN | MOUSE_LEFT_BUTTON_UP | MOUSE_RIGHT_BUTTON_DOWN | MOUSE_RIGHT_BUTTON_UP);
+        if (data->ButtonFlags & MOUSE_LEFT_BUTTON_DOWN) {
+            newButtonFlags |= MOUSE_RIGHT_BUTTON_DOWN;
+        }
+        if (data->ButtonFlags & MOUSE_LEFT_BUTTON_UP) {
+            newButtonFlags |= MOUSE_RIGHT_BUTTON_UP;
+        }
+        if (data->ButtonFlags & MOUSE_RIGHT_BUTTON_DOWN) {
+            newButtonFlags |= MOUSE_LEFT_BUTTON_DOWN;
+        }
+        if (data->ButtonFlags & MOUSE_RIGHT_BUTTON_UP) {
+            newButtonFlags |= MOUSE_LEFT_BUTTON_UP;
+        }
+        data->ButtonFlags = newButtonFlags;
 
-    return;
+        data->LastX /= 3;
+        data->LastY /= 3;
+    }
+
+    hDevice = WdfWdmDeviceGetWdfDeviceHandle(DeviceObject);
+
+    devExt = DeviceGetContext(hDevice);
+    //
+    // UpperConnectData must be called at DISPATCH
+    //
+    (*(PSERVICE_CALLBACK_ROUTINE)devExt->UpperConnectData.ClassService)(
+        devExt->UpperConnectData.ClassDeviceObject,
+        InputDataStart,
+        InputDataEnd,
+        InputDataConsumed
+    );
 }
